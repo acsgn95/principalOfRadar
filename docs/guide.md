@@ -551,4 +551,274 @@ flowchart TD
 
 ---
 
-*Sıradaki adım: Matched filter detayları, Range Migration Correction ve gerçek SAR verisi üzerinde uygulama.*
+---
+
+## 9. IQ Örnekleme: Karmaşık Sayı Nasıl Oluşur?
+
+### Fiziksel Süreç
+
+Radar anteni analog bir voltaj sinyali üretir. ADC (Analog-Dijital Çevirici) bu sinyali sayısallaştırır.
+
+```mermaid
+flowchart TD
+    A["📡 Antenden gelen RF sinyal"] --> B["Mixer I\ncos ile çarp"]
+    A --> C["Mixer Q\nsin ile çarp"]
+    B --> D["LPF\nAlçak geçiren filtre"]
+    C --> E["LPF\nAlçak geçiren filtre"]
+    D --> F["ADC\nI örnekleri"]
+    E --> G["ADC\nQ örnekleri"]
+    F --> H["Birleştir\nI + jQ"]
+    G --> H
+    H --> I["Karmaşık sinyal dizisi\n1024 karmaşık sayı"]
+
+    style I fill:#4CAF50,color:#fff
+```
+
+**I** = In-phase (gerçek kısım)
+**Q** = Quadrature (sanal kısım, 90° kaydırılmış)
+
+### Kaç Örnek Elde Edilir?
+
+$$N = f_s \times T_{chirp}$$
+
+**Örnek:** $f_s = 1$ MHz, $T_{chirp} = 1$ ms için:
+
+$$N = 1 \times 10^6 \times 1 \times 10^{-3} = 1000 \text{ örnek}$$
+
+### Nyquist Teoremi
+
+$$f_s \geq 2 \times f_{beat,max}$$
+
+En uzak hedefin beat frekansı:
+
+$$f_{beat,max} = \frac{B}{T} \times \frac{2R_{max}}{c}$$
+
+### Sinyal Formatı
+
+```python
+# Her eleman = o andaki karmaşık voltaj ölçümü
+signal = [
+    0.23 + 0.15j,   # t=0
+    0.31 + 0.08j,   # t=1
+    0.19 - 0.22j,   # t=2
+    ...              # N taneye kadar
+]
+```
+
+---
+
+## 10. Matched Filter
+
+### Temel Fikir
+
+Elimizde iki dizi var. Her ikisi de **N elemanlı karmaşık sayı dizisi**:
+
+```
+Chirp (bildiğimiz):    [z0, z1, z2, ..., zN]  → N elemanlı dizi
+Received (alınan):     [z0, z1, z2, ..., zN]  → N elemanlı dizi
+```
+
+Matched filter bu iki diziyi **karşılaştırır** (korelasyon). Birbirine en çok benzeyen yerde büyük bir değer çıkar. O nokta hedeftir!
+
+```
+Chirp:    [1, 2, 3, 4, 5, 6, 7, 8 ...]   ← Bildiğimiz şekil
+Received: [0, 0, 0, 1, 2, 3, 4, 5 ...]   ← Aynı şekil kaymış!
+                    ↑
+               Burada örtüşüyor → Hedef burada!
+```
+
+### Matematiksel Tanım
+
+$$y(\tau) = \int_{-\infty}^{\infty} s(t) \cdot h^*(t - \tau) \, dt$$
+
+Frekans domeninde çok daha hızlı hesaplanır:
+
+$$y = \text{IFFT}\Bigl[\text{FFT}(s_{alınan}) \times \text{FFT}^*(h_{referans})\Bigr]$$
+
+### Neden Conjugate Alıyoruz?
+
+Chirp sinyalinin fazı $e^{j\pi K t^2}$, conjugate'i $e^{-j\pi K t^2}$. İkisini çarpınca faz terimleri birbirini götürür ve sadece gecikmeye bağlı saf bir sinüs dalgası kalır. FFT bu sinüsün frekansını → gecikmeyi → mesafeyi verir.
+
+### Matched Filter Akışı
+
+```mermaid
+flowchart LR
+    A["Alınan sinyal\nN elemanlı dizi"] --> B["FFT\nS(f)"]
+    C["Referans chirp\nN elemanlı dizi"] --> D["FFT → Conjugate\nH*(f)"]
+    B --> E["Çarp\nS(f) × H*(f)"]
+    D --> E
+    E --> F["IFFT\ny(t)"]
+    F --> G["Peak nerede?\n→ Hedef orada!"]
+
+    style G fill:#4CAF50,color:#fff
+```
+
+### SNR Kazancı
+
+Matched filter sadece hedefi bulmaz, SNR'yi de maksimize eder:
+
+$$\text{SNR Kazancı} = B \times T_{chirp} = \text{TBP}$$
+
+**Örnek:** $B = 200$ MHz, $T = 1$ ms için TBP $= 200.000$. Yani gürültü 200.000 kat bastırılır!
+
+### Boyut Hiç Değişmez
+
+```
+Received:  N elemanlı → FFT → N elemanlı
+Chirp:     N elemanlı → FFT → N elemanlı
+Çarpım:    N elemanlı
+IFFT:      N elemanlı ← Sonuç hep N elemanlı!
+```
+
+---
+
+## 11. SAR'da Range Compression: 2D Matris İşleme
+
+SAR'da platform hareket ederken her pozisyondan bir chirp gönderilir. Tüm bu ölçümler bir **2D matris** oluşturur:
+
+```
+        Range (N_range örnek) →
+        ├─────────────────────────┤
+Pos 1   │ z z z z z z z z z z z │  ← 1. chirp: N karmaşık sayı
+Pos 2   │ z z z z z z z z z z z │  ← 2. chirp: N karmaşık sayı
+Pos 3   │ z z z z z z z z z z z │  ← 3. chirp: N karmaşık sayı
+...     │ z z z z z z z z z z z │
+Pos M   │ z z z z z z z z z z z │  ← M. chirp: N karmaşık sayı
+        └─────────────────────────┘
+Matris boyutu: M × N
+```
+
+Range compression bu matrisin **her satırına** matched filter uygular:
+
+$$\text{Her satır: } y_i = \text{IFFT}\Bigl[\text{FFT}(s_i) \times \text{FFT}^*(h_{ref})\Bigr]$$
+
+Boyut değişmez: **M×N → M×N**
+
+---
+
+## 12. Range Migration Correction (RMC)
+
+### Problem
+
+Range compression sonrası her hedefin azimuth yönündeki izi düz olması gerekirken hiperbolik kavis çiziyor:
+
+```
+Beklenen:              Gerçek:
+████████████████       *
+████████████████     *   *
+████████████████   *       *
+████████████████     *   *
+                       *
+```
+
+Bu kavis hedefin birden fazla range hücresine yayılmasından kaynaklanır.
+
+### Ne Zaman Gerekli?
+
+$$\Delta R_{max} = \frac{L_{syn}^2}{8R_0}$$
+
+Eğer $\Delta R_{max} > \Delta R / 4$ ise RMC şarttır.
+
+### Çözüm: İnterpolasyon
+
+Her azimuth pozisyonunda sinyali doğru range hücresine taşı:
+
+$$\Delta R(t) = R(t) - R_0 = \frac{v^2 t^2}{2R_0}$$
+
+```mermaid
+flowchart TD
+    A["Range Compressed\n(Hiperbolik izler)"] --> B["Her azimuth pozisyonu için\nΔR hesapla"]
+    B --> C["İnterpolasyon ile\nsinyali kaydır"]
+    C --> D["RMC Sonrası\n(Düz çizgiler)"]
+
+    style D fill:#4CAF50,color:#fff
+```
+
+---
+
+## 13. Azimuth Compression
+
+### Temel Fikir
+
+Azimuth yönündeki Doppler değişimi de bir chirp gibi davranır:
+
+$$f_d(t) = -\frac{2v^2 t}{\lambda R_0}$$
+
+Bu doğrusal frekans değişimi → Azimuth yönünde de matched filter uygulanabilir!
+
+Azimuth referans fonksiyonu:
+
+$$h_{az}(t) = e^{-j\pi K_a t^2}$$
+
+Azimuth chirp rate:
+
+$$K_a = \frac{2v^2}{\lambda R_0}$$
+
+### Range vs Azimuth Compression Karşılaştırması
+
+| | Range Compression | Azimuth Compression |
+|--|--|--|
+| Hangi yön | Her satır (yatay) | Her sütun (dikey) |
+| Referans | Bilinen chirp | Hesaplanan Doppler |
+| Chirp rate | $K = B/T$ | $K_a = 2v^2/\lambda R_0$ |
+| Sonuç | Range çözüldü ✅ | Azimuth çözüldü ✅ |
+
+### Azimuth Compression Akışı
+
+```mermaid
+flowchart LR
+    A["RMC Sonrası\nSütun i"] --> B["FFT\nAzimuth domain"]
+    C["Azimuth referans\nh_az hesapla\n(R0'a bağlı)"] --> D["FFT → Conjugate"]
+    B --> E["Çarp"]
+    D --> E
+    E --> F["IFFT"]
+    F --> G["Keskin nokta\nAzimuth çözüldü!"]
+
+    style G fill:#4CAF50,color:#fff
+```
+
+---
+
+## 14. Tam SAR İşleme Zinciri
+
+```mermaid
+flowchart TD
+    A["📡 Platform Hareket Eder"] --> B["Her pozisyonda\nFMCW chirp gönder/al"]
+    B --> C["2D Ham Veri Matrisi\nM × N"]
+    C --> D["Range Compression\nHer satıra Matched Filter\n✅ Range çözüldü"]
+    D --> E["Range Migration\nCorrection RMC\n✅ Hiperbol düzeltildi"]
+    E --> F["Azimuth Compression\nHer sütuna Matched Filter\n✅ Azimuth çözüldü"]
+    F --> G["🗺️ SAR Görüntüsü"]
+
+    style A fill:#2196F3,color:#fff
+    style C fill:#FF9800,color:#fff
+    style D fill:#9C27B0,color:#fff
+    style E fill:#FF5722,color:#fff
+    style F fill:#9C27B0,color:#fff
+    style G fill:#4CAF50,color:#fff
+```
+
+---
+
+## Güncel Formül Referans Kartı
+
+| Kavram | Formül | Açıklama |
+|--------|--------|----------|
+| Dalga boyu | $\lambda = c / f$ | Frekans ↑ → Dalga boyu ↓ |
+| Mesafe | $R = c \cdot t / 2$ | Gidiş-dönüş süresinden |
+| Faz | $\varphi = 4\pi R / \lambda$ | Mesafe → Faz dönüşümü |
+| Range çözünürlüğü | $\Delta R = c / 2B$ | Bant genişliği ↑ → İyi |
+| RAR Azimuth çözünürlüğü | $\Delta x = R \cdot \lambda / D$ | Mesafe ↑ → Kötüleşir |
+| Beat frekansı | $f_{beat} = (B/T) \cdot (2R/c)$ | FMCW mesafe ölçümü |
+| Örnek sayısı | $N = f_s \times T_{chirp}$ | ADC örnekleme |
+| TBP kazancı | $\text{TBP} = B \times T$ | SNR iyileşmesi |
+| Sentetik aperture | $L_{syn} = R \cdot \lambda / D$ | Uzun = Daha fazla veri |
+| **SAR çözünürlüğü** | $\Delta x_{SAR} = D / 2$ | **Mesafeden bağımsız!** |
+| Azimuth chirp rate | $K_a = 2v^2 / \lambda R_0$ | Azimuth matched filter |
+| Mesafe kayması | $\Delta R = v^2 t^2 / 2R_0$ | RMC için gerekli |
+| Doppler frekansı | $f_d = 2v \sin(\theta) / \lambda$ | Azimuth işleme temeli |
+| Anlık mesafe | $R(t) = \sqrt{R_0^2 + v^2 t^2}$ | Hiperbolik değişim |
+
+---
+
+*Sıradaki adım: Gerçek SAR verisi üzerinde uygulama ve donanım tasarımı.*
